@@ -88,6 +88,7 @@ local AppStoreListItem = InputContainer:extend{
 local AppStoreBrowserDialog
 
 local extractRepoOwner
+local ensureCacheDir
 local ensurePatchesDir
 local downloadToFile
 local buildPatchDownloadUrl
@@ -101,11 +102,17 @@ local buildBranchCandidates
 local getRepoDefaultBranch
 local extractMetaField
 local getPatchRecordsMap
+local extractPluginToUserDir
+local extractReleaseNameFallback
+local detectPluginFromArchiveWithFallback
+local renderReleaseNotesText
+local softWrapLongTokens
 
 local function buildPatchRepoDescriptor(record)
     if not record or not record.owner or not record.repo then
         return nil
     end
+
     local owner = record.owner
     return {
         kind = "patch",
@@ -119,6 +126,60 @@ local function buildPatchRepoDescriptor(record)
             owner = { login = owner },
             default_branch = record.branch or "HEAD",
         },
+    }
+end
+
+softWrapLongTokens = function(text, max_len)
+    max_len = tonumber(max_len) or 60
+    if not text or text == "" then
+        return ""
+    end
+    text = tostring(text)
+    return text:gsub("(%S+)", function(token)
+        if #token <= max_len then
+            return token
+        end
+        if token:match("[\128-\255]") then
+            return token
+        end
+        local parts = {}
+        local i = 1
+        while i <= #token do
+            parts[#parts + 1] = token:sub(i, i + max_len - 1)
+            i = i + max_len
+        end
+        return table.concat(parts, "\n")
+    end)
+end
+
+local function makeScrollableTextBoxForDialog(dialog, text)
+    local width = dialog and dialog.getAddedWidgetAvailableWidth and dialog:getAddedWidgetAvailableWidth()
+    width = tonumber(width) or math.floor(Device.screen:getWidth() * 0.8)
+    local height = math.floor(Device.screen:getHeight() * 0.7)
+    local scrollbar_slack = 3 * Device.screen:scaleBySize(6)
+    local content_width = math.max(width - scrollbar_slack, 200)
+    local default_face = nil
+    if TextWidget.getDefaultFace then
+        default_face = TextWidget:getDefaultFace()
+    end
+    if (not default_face) and Font and Font.getFace then
+        default_face = Font:getFace("infofont")
+    end
+
+    local box = TextBoxWidget:new{
+        text = text,
+        width = math.max(content_width - 2 * Size.padding.default, 160),
+        face = default_face,
+    }
+    local frame = FrameContainer:new{
+        padding = Size.padding.default,
+        bordersize = 0,
+        box,
+    }
+    return ScrollableContainer:new{
+        dimen = Geom:new{ w = width, h = height },
+        show_parent = dialog,
+        frame,
     }
 end
 local function makeTextBox(text)
@@ -137,6 +198,32 @@ local function makeTextBox(text)
         args.face = face
     end
     return TextBoxWidget:new(args)
+end
+
+local function makeScrollableTextBox(text)
+    local width = math.floor(Device.screen:getWidth() * 0.9)
+    local height = math.floor(Device.screen:getHeight() * 0.7)
+    local default_face = nil
+    if TextWidget.getDefaultFace then
+        default_face = TextWidget:getDefaultFace()
+    end
+    if (not default_face) and Font and Font.getFace then
+        default_face = Font:getFace("infofont")
+    end
+    local box = TextBoxWidget:new{
+        text = text,
+        width = width - 2 * Size.padding.default,
+        face = default_face,
+    }
+    local frame = FrameContainer:new{
+        padding = Size.padding.default,
+        bordersize = 0,
+        box,
+    }
+    return ScrollableContainer:new{
+        dimen = Geom:new{ w = width, h = height },
+        frame,
+    }
 end
 
 function AppStore:refreshPatchUpdates()
@@ -1813,7 +1900,7 @@ function AppStore:updatePluginFromRecord(record)
         mode = "update",
         plugin = plugin,
     }
-    self:installPluginFromRepo(descriptor)
+    self:promptPluginInstallOptions(descriptor)
 end
 
 function AppStore:updatePatchFromRecord(record)
@@ -2569,13 +2656,179 @@ function AppStoreBrowserDialog:resetScroll()
     end
 end
 
-local function ensureCacheDir()
+ensureCacheDir = function()
     local lfs = require("libs/libkoreader-lfs")
     local cache_dir = DataStorage:getDataDir() .. "/cache/AppStore"
     if lfs.attributes(cache_dir, "mode") ~= "directory" then
         lfs.mkdir(cache_dir)
     end
     return cache_dir
+end
+
+function AppStore:promptPluginInstallOptions(repo)
+    if not repo then
+        return
+    end
+
+    local owner = repo.owner or (repo.data and repo.data.owner and repo.data.owner.login)
+    if not owner or not repo.name then
+        UIManager:show(InfoMessage:new{ text = _("Missing repository metadata for installation."), timeout = 4 })
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local progress = InfoMessage:new{ text = _("Fetching release info…"), timeout = 0 }
+        UIManager:show(progress)
+        UIManager:forceRePaint()
+
+        local release, release_err = GitHub.fetchLatestRelease(owner, repo.name)
+
+        UIManager:close(progress)
+
+        local dialog
+        local buttons = {}
+
+        table.insert(buttons, {
+            text = _("Direct download from repo"),
+            callback = function()
+                UIManager:close(dialog)
+                self:installPluginFromRepo(repo)
+            end,
+        })
+
+        local assets = release and release.assets
+        if type(assets) == "table" then
+            for _, asset in ipairs(assets) do
+                local name = asset and asset.name
+                local url = asset and asset.browser_download_url
+                local is_source = name and (name:match("^Source code") ~= nil)
+                if name and url and not is_source then
+                    table.insert(buttons, {
+                        text = name,
+                        callback = function()
+                            UIManager:close(dialog)
+                            self:installPluginFromReleaseAsset(repo, release, asset)
+                        end,
+                    })
+                end
+            end
+        end
+
+        local show_notes = release ~= nil
+        if show_notes then
+            table.insert(buttons, {
+                text = _("View release notes"),
+                callback = function()
+                    UIManager:close(dialog)
+                    local notes_dialog = ConfirmBox:new{
+                        text = _("Release notes"),
+                        cancel_text = _("Close"),
+                        no_ok_button = true,
+                    }
+                    notes_dialog:addWidget(makeScrollableTextBoxForDialog(notes_dialog, renderReleaseNotesText(repo, release)))
+                    UIManager:show(notes_dialog)
+                end,
+            })
+        end
+
+        if release_err and #buttons == 1 then
+            UIManager:show(InfoMessage:new{ text = _("Could not fetch latest release. You can still use direct repo download."), timeout = 6 })
+        elseif #buttons == 1 then
+            UIManager:show(InfoMessage:new{ text = _("No release assets found. You can still use direct repo download."), timeout = 5 })
+        end
+
+        local button_rows = {}
+        for _, button in ipairs(buttons) do
+            table.insert(button_rows, { button })
+        end
+
+        dialog = ConfirmBox:new{
+            text = _("Download options"),
+            cancel_text = _("Cancel"),
+            no_ok_button = true,
+            other_buttons = button_rows,
+        }
+        UIManager:show(dialog)
+    end)
+end
+
+function AppStore:installPluginFromReleaseAsset(repo, release, asset)
+    if not repo or not asset then
+        return
+    end
+
+    local url = asset.browser_download_url
+    if not url or url == "" then
+        UIManager:show(InfoMessage:new{ text = _("Missing download URL for release asset."), timeout = 4 })
+        return
+    end
+
+    NetworkMgr:runWhenOnline(function()
+        local cache_dir = ensureCacheDir()
+        local downloads_dir = cache_dir .. "/downloads"
+        if lfs.attributes(downloads_dir, "mode") ~= "directory" then
+            lfs.mkdir(downloads_dir)
+        end
+
+        local safe_name = tostring(asset.name or (repo.name .. "-asset.zip")):gsub("[^%w_%-%.]", "_")
+        local zip_path = string.format("%s/%s-%d.zip", downloads_dir, safe_name, os.time())
+
+        local progress = InfoMessage:new{ text = _("Downloading release asset…"), timeout = 0 }
+        UIManager:show(progress)
+        local ok, err = downloadToFile(url, zip_path)
+        UIManager:close(progress)
+        if not ok then
+            util.removeFile(zip_path)
+            UIManager:show(InfoMessage:new{ text = _("Download failed: ") .. tostring(err), timeout = 6 })
+            return
+        end
+
+        local reader = Archiver.Reader:new()
+        if not reader:open(zip_path) then
+            util.removeFile(zip_path)
+            UIManager:show(InfoMessage:new{ text = _("Failed to open downloaded archive."), timeout = 6 })
+            return
+        end
+
+        local info, detect_err = detectPluginFromArchiveWithFallback(reader, repo, release, asset)
+        if not info then
+            reader:close()
+            util.removeFile(zip_path)
+            UIManager:show(InfoMessage:new{ text = detect_err or _("Could not detect plugin inside archive."), timeout = 6 })
+            return
+        end
+
+        if self.pending_install_context and self.pending_install_context.mode == "update" then
+            local ctx_plugin = self.pending_install_context.plugin
+            if ctx_plugin and ctx_plugin.dirname and ctx_plugin.dirname ~= "" then
+                info.plugin_dirname = ctx_plugin.dirname
+            end
+        end
+
+        local install_progress = InfoMessage:new{ text = _("Installing plugin…"), timeout = 0 }
+        UIManager:show(install_progress)
+        local ok_extract, dest_or_err = extractPluginToUserDir(reader, info)
+        reader:close()
+        util.removeFile(zip_path)
+
+        if not ok_extract then
+            UIManager:show(InfoMessage:new{ text = _("Installation failed: ") .. tostring(dest_or_err), timeout = 6 })
+            return
+        end
+
+        local msg
+        if info.plugin_version and info.plugin_version ~= "" then
+            msg = string.format(_("Installed plugin \"%s\" (version %s). Restart KOReader to load it."), info.plugin_name, info.plugin_version)
+        else
+            msg = string.format(_("Installed plugin \"%s\". Restart KOReader to load it."), info.plugin_name)
+        end
+        UIManager:show(InfoMessage:new{ text = msg, timeout = 8 })
+
+        self:handlePostInstall(info, repo)
+        if self.updates_menu then
+            self:updateUpdatesDialog()
+        end
+    end)
 end
 
 local function sanitizePluginDirname(name)
@@ -2589,6 +2842,35 @@ local function sanitizePluginDirname(name)
         name = name .. ".koplugin"
     end
     return name
+end
+
+extractReleaseNameFallback = function(repo, release, asset, meta_source)
+    local repo_name = repo and repo.name
+    local asset_name = asset and asset.name
+    local plugin_name
+    if meta_source and type(meta_source) == "string" then
+        plugin_name = meta_source:match('name%s*=%s*["\']([^"\']+)["\']')
+    end
+
+    local asset_plugin_dir = asset_name and asset_name:match("([%w_%-%.]+%.koplugin)%.zip$")
+    if asset_plugin_dir then
+        return asset_plugin_dir
+    end
+
+    local repo_is_plugin_dir = repo_name and repo_name:match("^[%w_%-%.]+%.koplugin$") ~= nil
+    if repo_is_plugin_dir then
+        return repo_name
+    end
+
+    if repo_name and repo_name:match("^[%w_%-%.]+$") then
+        return repo_name .. ".koplugin"
+    end
+
+    if plugin_name and plugin_name ~= "" then
+        return sanitizePluginDirname(plugin_name)
+    end
+
+    return sanitizePluginDirname("plugin")
 end
 
 local function truncateText(text, max_len)
@@ -4141,10 +4423,82 @@ local function detectPluginFromArchive(reader, repo)
     }
 end
 
-local function extractPluginToUserDir(reader, info)
+detectPluginFromArchiveWithFallback = function(reader, repo, release, asset)
+    local info, detect_err = detectPluginFromArchive(reader, repo)
+    if info and info.plugin_root and info.plugin_dirname then
+        return info, nil
+    end
+
+    local meta_entry_path
+    local root_candidate
+    local shallow_meta_entry
+    for entry in reader:iterate() do
+        if entry.mode == "file" then
+            if entry.path:match("/_meta%.lua$") then
+                meta_entry_path = entry.path
+                root_candidate = entry.path:match("(.+)/_meta%.lua$")
+                shallow_meta_entry = shallow_meta_entry or entry.path
+            end
+            if entry.path:match("/_meta%.lua$") and (not shallow_meta_entry or #entry.path < #shallow_meta_entry) then
+                shallow_meta_entry = entry.path
+                meta_entry_path = entry.path
+                root_candidate = entry.path:match("(.+)/_meta%.lua$")
+            end
+        end
+    end
+
+    if not meta_entry_path or not root_candidate then
+        return nil, detect_err or _("Could not locate plugin folder (_meta.lua) in archive.")
+    end
+
+    local meta_source = reader:extractToMemory(meta_entry_path)
+    local plugin_dirname = extractReleaseNameFallback(repo, release, asset, meta_source)
+
+    local plugin_name
+    local plugin_version
+    if meta_source and type(meta_source) == "string" then
+        plugin_name = meta_source:match('name%s*=%s*["\']([^"\']+)["\']')
+        plugin_version = meta_source:match('version%s*=%s*["\']([^"\']+)["\']')
+    end
+    if (not plugin_name or plugin_name == "") and plugin_dirname then
+        plugin_name = plugin_dirname:gsub("%.koplugin$", "")
+    end
+
+    return {
+        plugin_root = root_candidate,
+        plugin_dirname = plugin_dirname,
+        plugin_name = plugin_name,
+        plugin_version = plugin_version,
+    }, nil
+end
+
+renderReleaseNotesText = function(repo, release)
+    local title = repo and (repo.full_name or repo.name) or _("Repository")
+    local tag = release and (release.tag_name or release.name) or _("Latest release")
+    local body = release and release.body
+    if not body or body == json.null then
+        body = ""
+    end
+    body = tostring(body)
+    body = softWrapLongTokens(body, 60)
+    if body == "" then
+        body = _("No release notes.")
+    end
+    return table.concat({
+        string.format(_("Release notes for %s"), title),
+        string.format(_("Release: %s"), tostring(tag)),
+        "",
+        body,
+    }, "\n")
+end
+
+extractPluginToUserDir = function(reader, info)
     local plugins_root = DataStorage:getDataDir() .. "/plugins"
     util.makePath(plugins_root)
     local target_dir = plugins_root .. "/" .. info.plugin_dirname
+    if lfs.attributes(target_dir, "mode") == "directory" then
+        util.removePath(target_dir)
+    end
 
     for entry in reader:iterate() do
         if entry.mode == "file"
@@ -4201,7 +4555,7 @@ function AppStore:promptRepoAction(repo)
             text = _("Install plugin"),
             callback = function()
                 UIManager:close(dialog)
-                self:installPluginFromRepo(repo)
+                self:promptPluginInstallOptions(repo)
             end,
         })
     end

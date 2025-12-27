@@ -179,5 +179,23 @@ function GitHubClient.fetchRepoMetadata(owner, repo)
     return parsed, nil
 end
 
+function GitHubClient.fetchLatestRelease(owner, repo)
+    if not owner or not repo then
+        return nil, "missing owner/repo"
+    end
+    local path = string.format("/repos/%s/%s/releases/latest", owner, repo)
+    local code, body = request(path)
+    if code ~= 200 then
+        logger.warn("GitHub fetch latest release error", owner .. "/" .. repo, code, body)
+        return nil, { code = code, body = body }
+    end
+    local ok, parsed = pcall(json.decode, body)
+    if not ok then
+        logger.warn("GitHub fetch latest release decode error", parsed)
+        return nil, "decode"
+    end
+    return parsed, nil
+end
+
 return GitHubClient
 
