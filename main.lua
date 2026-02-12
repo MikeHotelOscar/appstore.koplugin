@@ -4508,8 +4508,40 @@ extractPluginToUserDir = function(reader, info)
     local plugins_root = DataStorage:getDataDir() .. "/plugins"
     util.makePath(plugins_root)
     local target_dir = plugins_root .. "/" .. info.plugin_dirname
+
+    -- Collect the set of relative paths coming from the archive so we can
+    -- remove only those files before extraction.  Files that exist locally
+    -- but are NOT in the archive (e.g. user-created configuration files)
+    -- are left untouched.
+    local archive_relatives = {}
+    for entry in reader:iterate() do
+        if entry.mode == "file" then
+            if info.plugin_root == "" then
+                archive_relatives[entry.path] = true
+            elseif entry.path:sub(1, #info.plugin_root + 1) == info.plugin_root .. "/" then
+                archive_relatives[entry.path:sub(#info.plugin_root + 2)] = true
+            end
+        end
+    end
+
+    -- Remove only the files that the archive will replace so stale code
+    -- from a previous version does not linger.
     if lfs.attributes(target_dir, "mode") == "directory" then
-        util.removePath(target_dir)
+        local function remove_archive_files(dir, prefix)
+            for f in lfs.dir(dir) do
+                if f ~= "." and f ~= ".." then
+                    local rel = (prefix == "") and f or (prefix .. "/" .. f)
+                    local full = dir .. "/" .. f
+                    local mode = lfs.attributes(full, "mode")
+                    if mode == "directory" then
+                        remove_archive_files(full, rel)
+                    elseif mode == "file" and archive_relatives[rel] then
+                        os.remove(full)
+                    end
+                end
+            end
+        end
+        remove_archive_files(target_dir, "")
     end
 
     for entry in reader:iterate() do
