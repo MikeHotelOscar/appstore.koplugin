@@ -61,6 +61,9 @@ input:focus,select:focus{border-color:var(--accent)}
 /* Controls bar */
 .controls{display:flex;gap:.75rem;padding:.75rem 1.5rem;background:var(--bg);align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border);position:sticky;z-index:99}
 .search-box{flex:1;min-width:200px;position:relative}
+.owner-filter-box{position:relative;min-width:140px}
+.owner-filter-box input{width:100%;padding-left:2rem}
+.owner-filter-box .owner-icon{position:absolute;left:.6rem;top:50%;transform:translateY(-50%);color:var(--text3);font-size:.8rem;pointer-events:none}
 .search-box input{width:100%;padding-left:2.2rem}
 .search-icon{position:absolute;left:.7rem;top:50%;transform:translateY(-50%);color:var(--text3);font-size:.9rem;pointer-events:none}
 /* Filter banner */
@@ -184,6 +187,11 @@ input:focus,select:focus{border-color:var(--accent)}
   <div class="search-box">
     <span class="search-icon">🔍</span>
     <input type="text" id="searchInput" placeholder="Search repos... (press Enter)" onkeydown="app.onSearchKeydown(event)">
+  </div>
+  <div class="owner-filter-box">
+    <span class="owner-icon">👤</span>
+    <input type="text" id="ownerInput" list="ownerDatalist" placeholder="Owner filter" oninput="app.onOwnerInput(this.value)">
+    <datalist id="ownerDatalist"></datalist>
   </div>
   <select class="sort-select" id="sortSelect" onchange="app.onSortChange(this.value)">
     <option value="stars_desc">⭐ Stars (high → low)</option>
@@ -321,7 +329,27 @@ const GitHub = {
   async request(path, query) {
     const url = query ? `${this.BASE}${path}?${query}` : `${this.BASE}${path}`;
     const res = await fetch(url, { headers: this.getHeaders() });
-    if (!res.ok) throw new Error(`GitHub API ${res.status}: ${res.statusText}`);
+    if (!res.ok) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        if (body.message) detail = body.message;
+      } catch(e) {}
+      const hasToken = !!(Storage.get('github_pat') || '').trim();
+      if (res.status === 429 || res.status === 403) {
+        const resetHeader = res.headers.get('X-RateLimit-Reset');
+        const remaining = res.headers.get('X-RateLimit-Remaining');
+        let extra = '';
+        if (resetHeader) {
+          const resetDate = new Date(parseInt(resetHeader) * 1000);
+          const mins = Math.max(1, Math.ceil((resetDate - Date.now()) / 60000));
+          extra = ` Resets in ~${mins} min.`;
+        }
+        if (!hasToken) extra += ' Add a GitHub token in ⚙️ Settings to increase the limit (10→30 req/min).';
+        throw new Error(`Rate limit exceeded (${res.status}).${extra} [${detail}]`);
+      }
+      throw new Error(`GitHub API ${res.status}: ${detail}`);
+    }
     return res.json();
   },
   async searchRepos(q, sort = 'stars', order = 'desc', page = 1, perPage = 100) {
@@ -430,8 +458,8 @@ const app = {
   tab: 'plugins',
   sortMode: 'stars_desc',
   tabState: {
-    plugins:  { query: '', minStars: 0, readmeSearch: false, includeForks: true },
-    patches:  { query: '', minStars: 0, readmeSearch: true, includeForks: true }
+    plugins:  { query: '', minStars: 0, readmeSearch: false, includeForks: true, ownerFilter: '' },
+    patches:  { query: '', minStars: 0, readmeSearch: true, includeForks: true, ownerFilter: '' }
   },
   readmeCache: {},
   data: { plugins: null, patches: null },
@@ -485,9 +513,11 @@ const app = {
   syncControlsToTab() {
     const s = this.ts;
     document.getElementById('searchInput').value = s.query ? s.query : '';
+    document.getElementById('ownerInput').value = s.ownerFilter || '';
     document.getElementById('minStarsInput').value = s.minStars || 0;
     document.getElementById('includeForks').checked = s.includeForks;
     document.getElementById('readmeSearch').checked = s.readmeSearch;
+    this.updateOwnerDatalist();
     this.updateFilterBanner();
   },
 
@@ -497,6 +527,7 @@ const app = {
     const text = document.getElementById('filterText');
     const parts = [];
     if (s.query) parts.push(`"${s.query}"`);
+    if (s.ownerFilter) parts.push(`owner: ${s.ownerFilter}`);
     if (s.minStars > 0) parts.push(`≥${s.minStars} ⭐`);
     if (!s.includeForks) parts.push('no forks');
     if (s.readmeSearch && s.query) parts.push('(+README)');
@@ -604,10 +635,25 @@ const app = {
   clearFilter() {
     const s = this.ts;
     s.query = '';
+    s.ownerFilter = '';
     s.minStars = 0;
     s.includeForks = true;
     this.syncControlsToTab();
     this.render();
+  },
+
+  onOwnerInput(value) {
+    this.ts.ownerFilter = value.trim().toLowerCase();
+    this.updateFilterBanner();
+    this.render();
+  },
+
+  updateOwnerDatalist() {
+    const repos = this.data[this.tab];
+    const dl = document.getElementById('ownerDatalist');
+    if (!repos || !dl) return;
+    const owners = [...new Set(repos.map(r => r.owner?.login).filter(Boolean))].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    dl.innerHTML = owners.map(o => `<option value="${esc(o)}">`).join('');
   },
 
   showSearchOverlay(msg) {
@@ -708,6 +754,9 @@ const app = {
     if (!s.includeForks) {
       list = list.filter(r => !r.fork);
     }
+    if (s.ownerFilter) {
+      list = list.filter(r => (r.owner?.login || '').toLowerCase().includes(s.ownerFilter));
+    }
     if (s.minStars > 0) {
       list = list.filter(r => (r.stargazers_count || 0) >= s.minStars);
     }
@@ -742,6 +791,7 @@ const app = {
       return;
     }
 
+    this.updateOwnerDatalist();
     const sorted = this.getSortedRepos(repos);
     const filtered = this.getFilteredRepos(sorted);
 
