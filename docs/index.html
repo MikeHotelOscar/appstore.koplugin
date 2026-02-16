@@ -775,12 +775,15 @@ const app = {
           this.readmeCache[key] = content.toLowerCase();
         } catch (e) {
           this.readmeCache[key] = '';
-          errorCount++;
-          if (!toastShown) {
-            toastShown = true;
-            const hasToken = !!(Storage.get('github_pat') || '').trim();
-            const hint = hasToken ? '' : ' Add a token in ⚙️ Settings to increase the limit.';
-            this.showToast(`<span class="toast-icon">⚠️</span>Some README fetches failed (rate limit likely).${hint}`, 6000);
+          const is404 = e.message && e.message.includes('404');
+          if (!is404) {
+            errorCount++;
+            if (!toastShown) {
+              toastShown = true;
+              const hasToken = !!(Storage.get('github_pat') || '').trim();
+              const hint = hasToken ? '' : ' Add a token in ⚙️ Settings to increase the limit.';
+              this.showToast(`<span class="toast-icon">⚠️</span>Some README fetches failed (rate limit likely).${hint}`, 6000);
+            }
           }
         }
         this.readmeLoading[key] = false;
