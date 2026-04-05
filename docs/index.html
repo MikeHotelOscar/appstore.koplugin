@@ -73,6 +73,9 @@ input:focus,select:focus{border-color:var(--accent)}
 .filter-banner .filter-text{flex:1}
 .filter-banner .filter-clear{background:none;color:var(--accent2);font-size:1.1rem;padding:.2rem .5rem;border-radius:4px;line-height:1}
 .filter-banner .filter-clear:hover{background:rgba(233,69,96,.2)}
+/* Error banner */
+.error-banner{display:none;padding:.6rem 1.5rem;background:#d32f2f;color:#fff;font-size:.85rem;text-align:center;position:sticky;z-index:99}
+.error-banner.visible{display:block}
 /* Search overlay */
 .search-overlay{display:none;position:fixed;inset:0;background:var(--overlay-bg);z-index:150;align-items:center;justify-content:center;flex-direction:column;gap:.75rem}
 .search-overlay.visible{display:flex}
@@ -220,6 +223,7 @@ input:focus,select:focus{border-color:var(--accent)}
   <span class="filter-text" id="filterText"></span>
   <button class="filter-clear" onclick="app.clearFilter()" title="Clear filter">✕</button>
 </div>
+<div class="error-banner" id="error-banner"></div>
 
 <div class="search-overlay" id="searchOverlay">
   <div class="search-overlay-box">
@@ -362,18 +366,51 @@ const GitHub = {
     const params = new URLSearchParams({ q, sort, order, page, per_page: perPage });
     return this.request('/search/repositories', params.toString());
   },
-  async searchAllPages(q, sort = 'stars', order = 'desc') {
+  async paginateQuery(q, sort = 'stars', order = 'desc') {
     const all = [];
     let page = 1;
+    let totalCount = 0;
     while (true) {
       const data = await this.searchRepos(q, sort, order, page, 100);
+      if (page === 1) totalCount = data.total_count || 0;
       const items = data.items || [];
       if (items.length === 0) break;
       all.push(...items);
-      if (items.length < 100 || all.length >= 1000) break;
+      if (items.length < 100) break;
       page++;
     }
-    return all;
+    return { items: all, totalCount };
+  },
+  async exhaustiveSearch(baseQuery, sort = 'stars', order = 'desc', dateFrom = null, dateTo = null, depth = 0) {
+    const LIMIT = 1000;
+    const MAX_DEPTH = 8;
+    const ORIGIN = '2010-01-01';
+    let query = baseQuery;
+    if (dateFrom && dateTo) query = `${baseQuery} created:${dateFrom}..${dateTo}`;
+    // Probe total_count
+    const probe = await this.searchRepos(query, sort, order, 1, 1);
+    const totalCount = probe.total_count || 0;
+    if (totalCount < LIMIT || depth >= MAX_DEPTH) {
+      if (totalCount >= LIMIT) console.warn(`Date bisect depth limit reached, some results may be lost: ${query} (${totalCount})`);
+      const result = await this.paginateQuery(query, sort, order);
+      return result.items;
+    }
+    // Bisect by created date
+    console.info(`Query has ${totalCount} results (>=1000), bisecting by date: ${query}`);
+    const fromTs = dateFrom ? new Date(dateFrom).getTime() : new Date(ORIGIN).getTime();
+    const toTs = dateTo ? new Date(dateTo).getTime() : Date.now();
+    if (toTs - fromTs < 86400000) {
+      const result = await this.paginateQuery(query, sort, order);
+      return result.items;
+    }
+    const midTs = Math.floor((fromTs + toTs) / 2);
+    const midDate = new Date(midTs).toISOString().slice(0, 10);
+    const nextDate = new Date(midTs + 86400000).toISOString().slice(0, 10);
+    const fromStr = dateFrom || ORIGIN;
+    const toStr = dateTo || new Date().toISOString().slice(0, 10);
+    const left = await this.exhaustiveSearch(baseQuery, sort, order, fromStr, midDate, depth + 1);
+    const right = await this.exhaustiveSearch(baseQuery, sort, order, nextDate, toStr, depth + 1);
+    return [...left, ...right];
   },
   async fetchRepoTree(owner, repo, ref = 'HEAD') {
     const cacheKey = `tree_${owner}/${repo}`;
@@ -474,12 +511,12 @@ const app = {
 
   QUERIES: {
     plugins: {
-      topics: ['topic:koreader-plugin fork:true'],
-      names: ['in:name ".koplugin" fork:true']
+      topics: ['topic:koreader-plugin'],
+      names: ['in:name ".koplugin"']
     },
     patches: {
-      topics: ['topic:koreader-user-patch fork:true'],
-      names: ['in:name "KOReader.patches" fork:true']
+      topics: ['topic:koreader-user-patch'],
+      names: ['in:name "KOReader.patches"']
     }
   },
 
@@ -590,24 +627,36 @@ const app = {
     if (pa && pa.repos) this.data.patches = pa.repos;
   },
 
+  expandQueryForForkStarSplit(baseQuery) {
+    return [
+      `${baseQuery} fork:only stars:0`,
+      `${baseQuery} fork:only stars:>=1`,
+      `${baseQuery} stars:0`,
+      `${baseQuery} stars:>=1`,
+    ];
+  },
+
   async fetchCategory(kind) {
     const queries = this.QUERIES[kind];
-    const allQueries = [...queries.topics, ...queries.names];
+    const allBaseQueries = [...queries.topics, ...queries.names];
     const seen = new Set();
     const results = [];
 
-    for (const q of allQueries) {
-      try {
-        const repos = await GitHub.searchAllPages(q);
-        for (const repo of repos) {
-          const key = repo.full_name.toLowerCase();
-          if (!seen.has(key)) {
-            seen.add(key);
-            results.push(repo);
+    for (const baseQ of allBaseQueries) {
+      const splitQueries = this.expandQueryForForkStarSplit(baseQ);
+      for (const q of splitQueries) {
+        try {
+          const repos = await GitHub.exhaustiveSearch(q);
+          for (const repo of repos) {
+            const key = repo.full_name.toLowerCase();
+            if (!seen.has(key)) {
+              seen.add(key);
+              results.push(repo);
+            }
           }
+        } catch (e) {
+          console.error(`Query failed [${q}]:`, e);
         }
-      } catch (e) {
-        console.error(`Query failed [${q}]:`, e);
       }
     }
     return results;
@@ -625,6 +674,15 @@ const app = {
       Storage.setJSON(`cache_${active}`, { repos, ts: Date.now() });
     } catch (e) {
       console.error('Fetch error:', e);
+      const msg = (e && e.message) ? e.message : String(e);
+      const banner = document.getElementById('error-banner');
+      if (banner) {
+        banner.textContent = msg;
+        banner.classList.add('visible');
+        setTimeout(() => banner.classList.remove('visible'), 12000);
+      } else {
+        alert(msg);
+      }
     }
 
     this.loading[active] = false;

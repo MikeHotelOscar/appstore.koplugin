@@ -107,15 +107,17 @@ function GitHubClient.searchRepositories(opts)
     local code, body = request("/search/repositories", query)
     if code ~= 200 then
         logger.warn("GitHub search error", code, body)
-        return nil, {
+        local err_info = {
             code = code,
             body = body,
+            is_rate_limit = (code == 403 or code == 429),
         }
+        return nil, err_info
     end
     local ok, parsed = pcall(json.decode, body)
     if not ok then
         logger.warn("GitHub search decode error", parsed)
-        return nil, "decode"
+        return nil, { code = 0, body = "decode", is_rate_limit = false }
     end
     return parsed, nil
 end

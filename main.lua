@@ -53,8 +53,8 @@ local STALE_WARNING_SECONDS = 7 * 24 * 3600
 local BROWSER_PAGE_SIZE = 14
 local PLUGIN_TOPICS = { "koreader-plugin" }
 local PATCH_TOPICS = { "koreader-user-patch" }
-local PLUGIN_NAME_QUERIES = { 'in:name ".koplugin" fork:true' }
-local PATCH_NAME_QUERIES = { 'in:name "KOReader.patches" fork:true' }
+local PLUGIN_NAME_QUERIES = { 'in:name ".koplugin"' }
+local PATCH_NAME_QUERIES = { 'in:name "KOReader.patches"' }
 local BROWSER_STATE_KEY = "browser_state"
 local PATCH_CACHE_TTL = 10 * 60
 local DEFAULT_SORT_MODE = "stars_desc"
@@ -4899,43 +4899,139 @@ local function appendUniqueRepo(target, seen, repo)
     table.insert(target, repo)
 end
 
-local function fetchByQueries(kind_label, queries, opts, append)
-    if not queries then
+-- GitHub Search API returns at most 1000 results per query.
+-- To overcome this, queries are split across fork status and star count
+-- (4-way: fork:only×stars:0, fork:only×stars:>=1, non-fork×stars:0, non-fork×stars:>=1).
+-- If any sub-query still hits the limit, it is further bisected by created date.
+local SEARCH_RESULT_LIMIT = 1000
+local SEARCH_DATE_BISECT_MAX_DEPTH = 8
+local SEARCH_ORIGIN_DATE = "2010-01-01"
+
+local function dateToTimestamp(date_str)
+    local y, m, d = date_str:match("(%d+)-(%d+)-(%d+)")
+    if not y then return os.time() end
+    return os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 0 })
+end
+
+local function timestampToDate(ts)
+    return os.date("%Y-%m-%d", ts)
+end
+
+local function expandQueryForForkStarSplit(base_query)
+    return {
+        base_query .. " fork:only stars:0",
+        base_query .. " fork:only stars:>=1",
+        base_query .. " stars:0",
+        base_query .. " stars:>=1",
+    }
+end
+
+local function buildRateLimitMessage()
+    if GitHub.hasAuthToken() then
+        return _("GitHub API rate limit exceeded. Please wait a few minutes and try again.")
+    end
+    return _("GitHub API rate limit exceeded. Add a GitHub token in AppStore settings to increase the limit (10→30 req/min).")
+end
+
+-- Paginate a single query up to the API limit, calling append for each repo.
+-- Returns (total_count, error_info_or_nil).
+local function paginateQuery(query, append)
+    local per_page = 100
+    local page = 1
+    local total_count = 0
+    while true do
+        local response, err = GitHub.searchRepositories({
+            q = query,
+            per_page = per_page,
+            sort = "stars",
+            order = "desc",
+            page = page,
+        })
+        if not response then
+            return nil, err
+        end
+        if page == 1 then
+            total_count = tonumber(response.total_count) or 0
+        end
+        local items = response.items or {}
+        if #items == 0 then
+            break
+        end
+        for _, repo in ipairs(items) do
+            append(repo)
+        end
+        if #items < per_page then
+            break
+        end
+        page = page + 1
+    end
+    return total_count
+end
+
+-- Exhaustively fetch all results for a query, automatically bisecting
+-- by created-date range when results hit the GitHub 1000-result ceiling.
+local function exhaustiveSearch(base_query, append, date_from, date_to, depth)
+    depth = depth or 0
+
+    local query = base_query
+    if date_from and date_to then
+        query = base_query .. string.format(" created:%s..%s", date_from, date_to)
+    end
+
+    -- Probe first page to learn total_count
+    local probe_response, probe_err = GitHub.searchRepositories({
+        q = query, per_page = 1, sort = "stars", order = "desc", page = 1,
+    })
+    if not probe_response then
+        if type(probe_err) == "table" and probe_err.is_rate_limit then
+            error(buildRateLimitMessage())
+        end
+        logger.warn("AppStore exhaustive search probe failed", query, probe_err and probe_err.body or probe_err)
         return
     end
-    local per_page = opts.per_page or 100
-    local sort = opts.sort or "stars"
-    local order = opts.order or "desc"
-    for _, query in ipairs(queries) do
-        if query and query ~= "" then
-            local page = 1
-            while true do
-                local request_opts = {
-                    q = query,
-                    per_page = per_page,
-                    sort = sort,
-                    order = order,
-                    page = page,
-                }
-                local response, err = GitHub.searchRepositories(request_opts)
-                if not response then
-                    local body = err and err.body or err
-                    error(string.format("%s query failed (%s): %s", kind_label, query, tostring(body)))
-                end
-                local items = response.items or {}
-                if #items == 0 then
-                    break
-                end
-                for _, repo in ipairs(items) do
-                    append(repo)
-                end
-                if #items < per_page then
-                    break
-                end
-                page = page + 1
-            end
+
+    local total_count = tonumber(probe_response.total_count) or 0
+
+    if total_count < SEARCH_RESULT_LIMIT or depth >= SEARCH_DATE_BISECT_MAX_DEPTH then
+        if total_count >= SEARCH_RESULT_LIMIT then
+            logger.warn("AppStore: date bisect depth limit reached, some results may be lost", query, total_count)
         end
+        -- Safe to paginate normally
+        local _, err = paginateQuery(query, append)
+        if err then
+            if type(err) == "table" and err.is_rate_limit then
+                error(buildRateLimitMessage())
+            end
+            logger.warn("AppStore exhaustive search pagination error", query, err)
+        end
+        return
     end
+
+    -- total_count >= 1000 — bisect by created date
+    logger.info("AppStore: query has", total_count, "results (>=1000), bisecting by date", query)
+    local from_ts = date_from and dateToTimestamp(date_from) or dateToTimestamp(SEARCH_ORIGIN_DATE)
+    local to_ts = date_to and dateToTimestamp(date_to) or os.time()
+
+    if to_ts - from_ts < 86400 then
+        -- Date range too small to split, just take what we can
+        local _, err = paginateQuery(query, append)
+        if err then
+            if type(err) == "table" and err.is_rate_limit then
+                error(buildRateLimitMessage())
+            end
+            logger.warn("AppStore exhaustive search pagination error (tiny range)", query, err)
+        end
+        return
+    end
+
+    local mid_ts = math.floor((from_ts + to_ts) / 2)
+    local mid_date = timestampToDate(mid_ts)
+    local next_date = timestampToDate(mid_ts + 86400)
+    local from_str = date_from or SEARCH_ORIGIN_DATE
+    local to_str = date_to or timestampToDate(os.time())
+
+    exhaustiveSearch(base_query, append, from_str, mid_date, depth + 1)
+    exhaustiveSearch(base_query, append, next_date, to_str, depth + 1)
 end
 
 function AppStore:fetchAndStore(kind, topics, label, name_queries)
@@ -4945,6 +5041,7 @@ function AppStore:fetchAndStore(kind, topics, label, name_queries)
         appendUniqueRepo(collected, seen, repo)
     end
 
+    -- Build base topic query (without fork/star qualifiers)
     if topics then
         local parts = {}
         for _, topic in ipairs(topics) do
@@ -4952,40 +5049,24 @@ function AppStore:fetchAndStore(kind, topics, label, name_queries)
                 table.insert(parts, string.format("topic:%s", topic))
             end
         end
-        table.insert(parts, "fork:true")
-        local topic_query = table.concat(parts, " ")
-        local per_page = 100
-        local sort = "stars"
-        local order = "desc"
-        local page = 1
-        while true do
-            local request_opts = {
-                q = topic_query,
-                per_page = per_page,
-                sort = sort,
-                order = order,
-                page = page,
-            }
-            local response, err = GitHub.searchRepositories(request_opts)
-            if not response then
-                local body = err and err.body or err
-                error(string.format("%s topic search failed (%s): %s", label, topic_query, tostring(body)))
-            end
-            local items = response.items or {}
-            if #items == 0 then
-                break
-            end
-            for _, repo in ipairs(items) do
-                append(repo)
-            end
-            if #items < per_page then
-                break
-            end
-            page = page + 1
+        local base_topic_query = table.concat(parts, " ")
+        local split_queries = expandQueryForForkStarSplit(base_topic_query)
+        for _, query in ipairs(split_queries) do
+            exhaustiveSearch(query, append)
         end
     end
 
-    fetchByQueries(label, name_queries, { per_page = 100 }, append)
+    -- Name-based queries (also split 4-way)
+    if name_queries then
+        for _, base_query in ipairs(name_queries) do
+            if base_query and base_query ~= "" then
+                local split_queries = expandQueryForForkStarSplit(base_query)
+                for _, query in ipairs(split_queries) do
+                    exhaustiveSearch(query, append)
+                end
+            end
+        end
+    end
 
     Cache.storeRepos(kind, collected)
     return #collected
